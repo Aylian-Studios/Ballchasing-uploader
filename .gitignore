@@ -1,0 +1,18 @@
+# Rust
+target/*
+debug
+Cargo.lock
+
+# Helper/IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Project Data
+*.replay
+*.log
+
+# Secrets
+.env

@@ -1,0 +1,120 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    Unlisted,
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Public => "public",
+            Self::Unlisted => "unlisted",
+            Self::Private => "private",
+        }
+    }
+}
+
+impl std::str::FromStr for Visibility {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "public" => Ok(Self::Public),
+            "unlisted" => Ok(Self::Unlisted),
+            "private" => Ok(Self::Private),
+            _ => anyhow::bail!("Invalid visibility: '{}'. Use public, unlisted, or private.", s),
+        }
+    }
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Self::Private
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploaderConfig {
+    pub api_key: String,
+    pub watch_dir: PathBuf,
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub uploaded_hashes: Vec<String>,
+}
+
+impl Default for UploaderConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            watch_dir: default_replay_dir(),
+            visibility: Visibility::default(),
+            uploaded_hashes: Vec::new(),
+        }
+    }
+}
+
+impl UploaderConfig {
+    pub fn load(path: &PathBuf) -> Self {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(data) => match serde_json::from_str(&data) {
+                    Ok(config) => return config,
+                    Err(e) => eprintln!("Warning: config parse error: {}", e),
+                },
+                Err(e) => eprintln!("Warning: config read error: {}", e),
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self, path: &PathBuf) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn is_uploaded(&self, hash: &str) -> bool {
+        self.uploaded_hashes.iter().any(|h| h == hash)
+    }
+    pub fn mark_uploaded(&mut self, hash: String) {
+        if !self.is_uploaded(&hash) {
+            self.uploaded_hashes.push(hash);
+        }
+    }
+}
+
+pub fn default_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ballchasing-uploader")
+        .join("config.json")
+}
+
+pub fn default_replay_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        dirs::document_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("My Games")
+            .join("Rocket League")
+            .join("TAGame")
+            .join("Demos")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local")
+            .join("share")
+            .join("Rocket League")
+            .join("TAGame")
+            .join("Demos")
+    }
+}

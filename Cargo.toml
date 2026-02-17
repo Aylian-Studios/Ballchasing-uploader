@@ -1,0 +1,28 @@
+[package]
+name = "ballchasing_uploader"
+version = "0.1.0"
+edition = "2021"
+description = "Auto-upload Rocket League replays to ballchasing.com"
+license = "MIT"
+repository = "https://github.com/your-username/ballchasing-uploader"
+
+[[bin]]
+name = "ballchasing-uploader"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+tokio = { version = "1.28", features = ["full"] }
+notify = "6.0"
+notify-debouncer-mini = "0.4"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+
+# GUI
+eframe = "0.27"
+egui = "0.27"
+rfd = "0.12"
