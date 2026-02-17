@@ -100,8 +100,6 @@ impl UploaderState {
         }
     }
 
-    /// Update an existing log entry's status (by filename), or insert a new one.
-    /// Used after the initial "Uploading" entry to replace it with the final result.
     pub fn update_log(&mut self, file_name: &str, status: UploadLogStatus) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         if let Some(entry) = self.upload_log.iter_mut().find(|e| e.file_name == file_name) {
@@ -228,18 +226,10 @@ impl UploaderApp {
     fn start_watcher(&self) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         
-        // Don't start if already active
         if s.watcher_active {
             eprintln!("Auto-upload: already active");
             return;
         }
-
-        // if API status is unknown/verifying, we might want to wait, but for now strict check:
-        // Actually, on startup `api_key_status` might be `Unknown` until the ping thread finishes.
-        // We should probably allow starting if we have a key, and let the upload fail if key is bad?
-        // Or better: The original logic checked `api_valid`. On startup, `api_key_status` is `Unknown`.
-        // We can't rely on `api_key_status` being `Valid` immediately on startup.
-        // Let's rely on `api_key` being present in config.
         
         let has_key = !s.config.api_key.is_empty();
         let has_folder = s.effective_watch_dir().is_some();
@@ -600,17 +590,10 @@ impl UploaderApp {
             s.auto_upload = auto_upload;
 
             if auto_upload {
-                drop(s); // release lock before calling start_watcher
+                drop(s);
                 self.start_watcher();
             } else {
                 s.status_message = "Idle".to_string();
-                // We don't explicitly kill the thread here, but the thread loop checks `s.auto_upload`
-                // However, the thread is blocked on `rx.recv()`.
-                // Ideally we'd send a signal, but for now the user has to wait for an event or close app?
-                // Actually, `watcher::watch_directory` returns a receiver. The sender is held by the watcher thread (notify).
-                // If we want to stop it effectively, we might need a control channel.
-                // But for this simple app, setting `auto_upload = false` prevents *processing* next file.
-                // The `status_message` update is immediate.
             }
         }
         if snap.watcher_active {
@@ -671,17 +654,13 @@ impl UploaderApp {
     }
 }
 
-/// Try to open a file with exclusive (non-shared) access on Windows.
-/// If Rocket League still has the file open for writing, this will fail.
-/// On non-Windows platforms, just checks the file is readable.
 fn try_exclusive_access(path: &PathBuf) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::fs::OpenOptions;
-        // Try to open with write access — will fail if another process holds a write handle
         match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(_) => true,  // We got exclusive access, file is no longer being written
-            Err(_) => false, // Still locked by Rocket League
+            Ok(_) => true,
+            Err(_) => false,
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -690,17 +669,11 @@ fn try_exclusive_access(path: &PathBuf) -> bool {
     }
 }
 
-/// Wait for a file to stop being written and become fully available.
-/// Rocket League writes .replay files while holding a write handle open.
-/// On Windows, we check for exclusive file access to know when RL is done.
 fn wait_for_file_stable(path: &PathBuf) -> bool {
-    // Initial delay — let Rocket League start and progress its write
     std::thread::sleep(Duration::from_secs(2));
 
     for _ in 0..20 {
-        // Check if we can get exclusive access (RL has closed the file handle)
         if try_exclusive_access(path) {
-            // Double check: file has content and size is stable
             let size1 = match std::fs::metadata(path) {
                 Ok(m) => m.len(),
                 Err(_) => return false,
@@ -720,7 +693,7 @@ fn wait_for_file_stable(path: &PathBuf) -> bool {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    false // File still not available after ~12 seconds
+    false
 }
 
 fn process_new_file(
@@ -736,7 +709,6 @@ fn process_new_file(
         .to_string_lossy()
         .to_string();
 
-    // Wait for the file to finish being written
     if !wait_for_file_stable(path) {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -764,7 +736,6 @@ fn process_new_file(
         }
     }
 
-    // Show uploading status with file size for diagnostics
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());

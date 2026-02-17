@@ -86,13 +86,12 @@ impl BallchasingClient {
 
         Ok(resp.json()?)
     }
-// ...
+
     pub fn upload_replay(
         &self,
         path: &Path,
         visibility: &str,
     ) -> std::result::Result<UploadResponse, UploadError> {
-        // Wait for file to be fully written and released by the game
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         let form = reqwest::blocking::multipart::Form::new()
