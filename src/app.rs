@@ -86,7 +86,7 @@ impl UploaderState {
             folder_status,
             config: cfg,
             config_path,
-            auto_upload: false,
+            auto_upload: true,
             watcher_active: false,
             upload_log: Vec::new(),
             status_message: "Idle".to_string(),
@@ -97,6 +97,25 @@ impl UploaderState {
         self.upload_log.insert(0, entry);
         if self.upload_log.len() > 20 {
             self.upload_log.truncate(20);
+        }
+    }
+
+    /// Update an existing log entry's status (by filename), or insert a new one.
+    /// Used after the initial "Uploading" entry to replace it with the final result.
+    pub fn update_log(&mut self, file_name: &str, status: UploadLogStatus) {
+        let time = chrono::Local::now().format("%H:%M:%S").to_string();
+        if let Some(entry) = self.upload_log.iter_mut().find(|e| e.file_name == file_name) {
+            entry.status = status;
+            entry.time = time;
+        } else {
+            self.upload_log.insert(0, UploadLogEntry {
+                file_name: file_name.to_string(),
+                status,
+                time,
+            });
+            if self.upload_log.len() > 20 {
+                self.upload_log.truncate(20);
+            }
         }
     }
 
@@ -150,29 +169,23 @@ impl UploaderApp {
                     s.api_key_status = ApiKeyStatus::Verifying;
                 }
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    rt.block_on(async {
-                        let client = api::BallchasingClient::new(&key);
-                        match client.ping().await {
-                            Ok(info) => {
-                                let mut s =
-                                    state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                s.api_key_status = ApiKeyStatus::Valid {
-                                    name: info.name,
-                                    account_type: info.account_type,
-                                };
-                            }
-                            Err(e) => {
-                                let mut s =
-                                    state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                s.api_key_status =
-                                    ApiKeyStatus::Invalid(format!("{}", e));
-                            }
+                    let client = api::BallchasingClient::new(&key);
+                    match client.ping() {
+                        Ok(info) => {
+                            let mut s =
+                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status = ApiKeyStatus::Valid {
+                                name: info.name,
+                                account_type: info.account_type,
+                            };
                         }
-                    });
+                        Err(e) => {
+                            let mut s =
+                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status =
+                                ApiKeyStatus::Invalid(format!("{}", e));
+                        }
+                    }
                 });
             }
         }
@@ -180,36 +193,118 @@ impl UploaderApp {
         {
             let state_clone = state.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async {
-                    let (api_key, config_path) = {
-                        let s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                        (s.config.api_key.clone(), s.config_path.clone())
-                    };
-                    if api_key.is_empty() {
-                        return;
-                    }
-                    let data_dir = config_path
-                        .parent()
-                        .unwrap_or(&PathBuf::from("."))
-                        .to_path_buf();
-                    let queue_path = data_dir.join("upload_queue.json");
-                    let mut queue = upload_queue::UploadQueue::load(&queue_path);
-                    queue.prune_expired();
-                    let count = queue.pending().len();
-                    if count > 0 {
-                        let mut s =
-                            state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                        s.status_message = format!("Retrying {} pending upload(s)...", count);
-                    }
-                });
+                let (api_key, config_path) = {
+                    let s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    (s.config.api_key.clone(), s.config_path.clone())
+                };
+                if api_key.is_empty() {
+                    return;
+                }
+                let data_dir = config_path
+                    .parent()
+                    .unwrap_or(&PathBuf::from("."))
+                    .to_path_buf();
+                let queue_path = data_dir.join("upload_queue.json");
+                let mut queue = upload_queue::UploadQueue::load(&queue_path);
+                queue.prune_expired();
+                let count = queue.pending().len();
+                if count > 0 {
+                    let mut s =
+                        state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    s.status_message = format!("Retrying {} pending upload(s)...", count);
+                }
             });
         }
 
+        if state.lock().unwrap().auto_upload {
+            let app = Self { state: state.clone() };
+            app.start_watcher();
+            return app;
+        }
+
         Self { state }
+    }
+
+    fn start_watcher(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        
+        // Don't start if already active
+        if s.watcher_active {
+            eprintln!("Auto-upload: already active");
+            return;
+        }
+
+        // if API status is unknown/verifying, we might want to wait, but for now strict check:
+        // Actually, on startup `api_key_status` might be `Unknown` until the ping thread finishes.
+        // We should probably allow starting if we have a key, and let the upload fail if key is bad?
+        // Or better: The original logic checked `api_valid`. On startup, `api_key_status` is `Unknown`.
+        // We can't rely on `api_key_status` being `Valid` immediately on startup.
+        // Let's rely on `api_key` being present in config.
+        
+        let has_key = !s.config.api_key.is_empty();
+        let has_folder = s.effective_watch_dir().is_some();
+
+        if !has_key {
+            eprintln!("Auto-upload abort: No API key configured");
+            s.status_message = "Verify your API key first".to_string();
+            s.auto_upload = false;
+            return;
+        }
+        
+        if !has_folder {
+            eprintln!("Auto-upload abort: No replay folder detected");
+            s.status_message = "Set replay folder first".to_string();
+            s.auto_upload = false;
+            return;
+        }
+
+        let watch_dir = s.effective_watch_dir().unwrap();
+        let api_key = s.config.api_key.clone();
+        let visibility = s.config.visibility.as_str().to_string();
+        let state_clone = self.state.clone();
+        let config_path = s.config_path.clone();
+
+        match watcher::watch_directory(&watch_dir) {
+            Ok(rx) => {
+                s.watcher_active = true;
+                s.status_message = format!("Watching {:?} for new replays...", watch_dir);
+                drop(s);
+
+                std::thread::spawn(move || {
+                    let client = api::BallchasingClient::new(&api_key);
+
+                    loop {
+                        match rx.recv() {
+                            Ok(path) => {
+                                // Check if we should still be running
+                                {
+                                    let s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                                    if !s.auto_upload {
+                                        break; 
+                                    }
+                                }
+                                process_new_file(
+                                    &client,
+                                    &path,
+                                    &visibility,
+                                    &state_clone,
+                                    &config_path,
+                                );
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    s.watcher_active = false;
+                    s.status_message = "Idle".to_string();
+                });
+            }
+            Err(e) => {
+                s.status_message = format!("Watcher error: {}", e);
+                s.auto_upload = false;
+            }
+        }
     }
 }
 
@@ -230,9 +325,35 @@ impl eframe::App for UploaderApp {
             }
         };
 
+        // Branding Footer (Must be added before CentralPanel)
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak().small());
+                
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.hyperlink_to("Aylian Studios", "https://aylian-studios.com");
+                    ui.label(egui::RichText::new("Built by ").weak());
+                    
+                    ui.separator();
+                    
+                    ui.hyperlink_to("GitHub", "https://github.com/Aylian-Studios/ballchasing-uploader");
+                    ui.label("|");
+                    ui.hyperlink_to("Project Page", "https://aylian-studios.com/projects/ballchasing-uploader");
+                    
+                    ui.separator();
+                    
+                    if ui.link("Check for Updates").clicked() {
+                        let _ = open::that("https://github.com/DarknessPledge/ballchasing-uploader/releases");
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Ballchasing Uploader");
-            ui.label(egui::RichText::new("v0.1.0 — Auto-upload replays to ballchasing.com").weak().small());
+            ui.label(egui::RichText::new(format!("v{} — Auto-upload replays to ballchasing.com", env!("CARGO_PKG_VERSION"))).weak().small());
             ui.separator();
             ui.add_space(4.0);
             self.render_api_key_section(ui, &snap);
@@ -331,29 +452,23 @@ impl UploaderApp {
                     let _ = s.config.save(&s.config_path);
                 }
                 std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    rt.block_on(async {
-                        let client = api::BallchasingClient::new(&key);
-                        match client.ping().await {
-                            Ok(info) => {
-                                let mut s =
-                                    state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                s.api_key_status = ApiKeyStatus::Valid {
-                                    name: info.name,
-                                    account_type: info.account_type,
-                                };
-                            }
-                            Err(e) => {
-                                let mut s =
-                                    state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                s.api_key_status =
-                                    ApiKeyStatus::Invalid(format!("{}", e));
-                            }
+                    let client = api::BallchasingClient::new(&key);
+                    match client.ping() {
+                        Ok(info) => {
+                            let mut s =
+                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status = ApiKeyStatus::Valid {
+                                name: info.name,
+                                account_type: info.account_type,
+                            };
                         }
-                    });
+                        Err(e) => {
+                            let mut s =
+                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status =
+                                ApiKeyStatus::Invalid(format!("{}", e));
+                        }
+                    }
                 });
             }
         });
@@ -485,68 +600,17 @@ impl UploaderApp {
             s.auto_upload = auto_upload;
 
             if auto_upload {
-                let api_valid = matches!(s.api_key_status, ApiKeyStatus::Valid { .. });
-                let has_folder = s.effective_watch_dir().is_some();
-
-                if !api_valid {
-                    s.status_message = "Verify your API key first".to_string();
-                    s.auto_upload = false;
-                } else if !has_folder {
-                    s.status_message = "Set replay folder first".to_string();
-                    s.auto_upload = false;
-                } else if !s.watcher_active {
-                    let watch_dir = s.effective_watch_dir().unwrap();
-                    let api_key = s.config.api_key.clone();
-                    let visibility = s.config.visibility.as_str().to_string();
-                    let state_clone = self.state.clone();
-                    let config_path = s.config_path.clone();
-
-                    match watcher::watch_directory(&watch_dir) {
-                        Ok(rx) => {
-                            s.watcher_active = true;
-                            s.status_message = "Watching for replays...".to_string();
-                            drop(s);
-
-                            std::thread::spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .unwrap();
-                                let client = api::BallchasingClient::new(&api_key);
-
-                                rt.block_on(async {
-                                    loop {
-                                        match rx.recv() {
-                                            Ok(path) => {
-                                                process_new_file(
-                                                    &client,
-                                                    &path,
-                                                    &visibility,
-                                                    &state_clone,
-                                                    &config_path,
-                                                )
-                                                .await;
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                });
-
-                                let mut s = state_clone
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                s.watcher_active = false;
-                                s.status_message = "Idle".to_string();
-                            });
-                        }
-                        Err(e) => {
-                            s.status_message = format!("Watcher error: {}", e);
-                            s.auto_upload = false;
-                        }
-                    }
-                }
+                drop(s); // release lock before calling start_watcher
+                self.start_watcher();
             } else {
                 s.status_message = "Idle".to_string();
+                // We don't explicitly kill the thread here, but the thread loop checks `s.auto_upload`
+                // However, the thread is blocked on `rx.recv()`.
+                // Ideally we'd send a signal, but for now the user has to wait for an event or close app?
+                // Actually, `watcher::watch_directory` returns a receiver. The sender is held by the watcher thread (notify).
+                // If we want to stop it effectively, we might need a control channel.
+                // But for this simple app, setting `auto_upload = false` prevents *processing* next file.
+                // The `status_message` update is immediate.
             }
         }
         if snap.watcher_active {
@@ -569,28 +633,37 @@ impl UploaderApp {
                 .max_height(200.0)
                 .show(ui, |ui| {
                     for entry in &snap.upload_log {
-                        ui.horizontal(|ui| {
-                            let (color, icon) = match &entry.status {
-                                UploadLogStatus::Uploading => {
-                                    (egui::Color32::YELLOW, "...")
-                                }
-                                UploadLogStatus::Success(_) => {
-                                    (egui::Color32::GREEN, "[ok]")
-                                }
-                                UploadLogStatus::Duplicate => {
-                                    (egui::Color32::GRAY, "[dup]")
-                                }
-                                UploadLogStatus::Failed(_) => {
-                                    (egui::Color32::RED, "[!]")
-                                }
-                            };
-                            ui.colored_label(color, icon);
-                            ui.label(
-                                egui::RichText::new(&entry.file_name).small(),
-                            );
-                            ui.label(
-                                egui::RichText::new(&entry.time).weak().small(),
-                            );
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                let (color, icon) = match &entry.status {
+                                    UploadLogStatus::Uploading => {
+                                        (egui::Color32::YELLOW, "...")
+                                    }
+                                    UploadLogStatus::Success(_) => {
+                                        (egui::Color32::GREEN, "[ok]")
+                                    }
+                                    UploadLogStatus::Duplicate => {
+                                        (egui::Color32::GRAY, "[dup]")
+                                    }
+                                    UploadLogStatus::Failed(_) => {
+                                        (egui::Color32::RED, "[!]")
+                                    }
+                                };
+                                ui.colored_label(color, icon);
+                                ui.label(
+                                    egui::RichText::new(&entry.file_name).small(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&entry.time).weak().small(),
+                                );
+                            });
+                            if let UploadLogStatus::Failed(ref err) = entry.status {
+                                ui.label(
+                                    egui::RichText::new(format!("    {}", err))
+                                        .color(egui::Color32::RED)
+                                        .small(),
+                                );
+                            }
                         });
                     }
                 });
@@ -598,7 +671,59 @@ impl UploaderApp {
     }
 }
 
-async fn process_new_file(
+/// Try to open a file with exclusive (non-shared) access on Windows.
+/// If Rocket League still has the file open for writing, this will fail.
+/// On non-Windows platforms, just checks the file is readable.
+fn try_exclusive_access(path: &PathBuf) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::fs::OpenOptions;
+        // Try to open with write access — will fail if another process holds a write handle
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(_) => true,  // We got exclusive access, file is no longer being written
+            Err(_) => false, // Still locked by Rocket League
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.exists()
+    }
+}
+
+/// Wait for a file to stop being written and become fully available.
+/// Rocket League writes .replay files while holding a write handle open.
+/// On Windows, we check for exclusive file access to know when RL is done.
+fn wait_for_file_stable(path: &PathBuf) -> bool {
+    // Initial delay — let Rocket League start and progress its write
+    std::thread::sleep(Duration::from_secs(2));
+
+    for _ in 0..20 {
+        // Check if we can get exclusive access (RL has closed the file handle)
+        if try_exclusive_access(path) {
+            // Double check: file has content and size is stable
+            let size1 = match std::fs::metadata(path) {
+                Ok(m) => m.len(),
+                Err(_) => return false,
+            };
+            if size1 == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let size2 = match std::fs::metadata(path) {
+                Ok(m) => m.len(),
+                Err(_) => return false,
+            };
+            if size1 == size2 {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false // File still not available after ~12 seconds
+}
+
+fn process_new_file(
     client: &api::BallchasingClient,
     path: &PathBuf,
     visibility: &str,
@@ -611,10 +736,23 @@ async fn process_new_file(
         .to_string_lossy()
         .to_string();
 
+    // Wait for the file to finish being written
+    if !wait_for_file_stable(path) {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        s.update_log(&file_name, UploadLogStatus::Failed(
+            format!("File not ready after 12s (size: {} bytes)", size),
+        ));
+        return;
+    }
+
     let hash = match upload_queue::hash_file(path) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("Hash error for {}: {}", file_name, e);
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            s.update_log(&file_name, UploadLogStatus::Failed(
+                format!("Hash error: {}", e),
+            ));
             return;
         }
     };
@@ -626,41 +764,34 @@ async fn process_new_file(
         }
     }
 
+    // Show uploading status with file size for diagnostics
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
         s.add_log(UploadLogEntry {
             file_name: file_name.clone(),
             status: UploadLogStatus::Uploading,
-            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            time: format!("{} ({}KB)", chrono::Local::now().format("%H:%M:%S"), file_size / 1024),
         });
     }
 
-    match client.upload_replay(path, visibility).await {
+    match client.upload_replay(path, visibility) {
         Ok(resp) => {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             s.config.mark_uploaded(hash);
             let _ = s.config.save(config_path);
-            s.add_log(UploadLogEntry {
-                file_name: file_name.clone(),
-                status: UploadLogStatus::Success(resp.id),
-                time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            });
+            s.update_log(&file_name, UploadLogStatus::Success(resp.id));
         }
         Err(e) => {
             let msg = format!("{}", e);
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-            let status = if msg.contains("Duplicate") {
+            if msg.contains("Duplicate") {
                 s.config.mark_uploaded(hash);
                 let _ = s.config.save(config_path);
-                UploadLogStatus::Duplicate
+                s.update_log(&file_name, UploadLogStatus::Duplicate);
             } else {
-                UploadLogStatus::Failed(msg)
-            };
-            s.add_log(UploadLogEntry {
-                file_name: file_name.clone(),
-                status,
-                time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            });
+                s.update_log(&file_name, UploadLogStatus::Failed(msg));
+            }
         }
     }
 }

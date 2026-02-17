@@ -1,5 +1,4 @@
 use anyhow::Result;
-use reqwest::multipart;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -40,69 +39,77 @@ impl std::fmt::Display for UploadError {
 
 impl std::error::Error for UploadError {}
 
+impl From<reqwest::Error> for UploadError {
+    fn from(err: reqwest::Error) -> Self {
+        UploadError::Network(err)
+    }
+}
+
+impl From<std::io::Error> for UploadError {
+    fn from(err: std::io::Error) -> Self {
+        UploadError::ApiError(format!("IO error: {}", err))
+    }
+}
+
+#[derive(Debug)]
 pub struct BallchasingClient {
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
     api_key: String,
 }
 
 impl BallchasingClient {
     pub fn new(api_key: &str) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .http1_only()
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: api_key.to_string(),
         }
     }
 
-    pub async fn ping(&self) -> Result<PingResponse> {
+    pub fn ping(&self) -> Result<PingResponse> {
         let resp = self
             .client
             .get(BASE_URL)
             .header("Authorization", &self.api_key)
-            .send()
-            .await?;
+            .send()?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().unwrap_or_default();
             anyhow::bail!("Ping failed ({}): {}", status, body);
         }
 
-        Ok(resp.json().await?)
+        Ok(resp.json()?)
     }
-
-    pub async fn upload_replay(
+// ...
+    pub fn upload_replay(
         &self,
         path: &Path,
         visibility: &str,
     ) -> std::result::Result<UploadResponse, UploadError> {
-        let file_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let file_bytes = std::fs::read(path).map_err(|e| {
-            UploadError::ApiError(format!("Failed to read file: {}", e))
-        })?;
+        // Wait for file to be fully written and released by the game
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let part = multipart::Part::bytes(file_bytes)
-            .file_name(file_name)
-            .mime_str("application/octet-stream")
-            .map_err(|e| UploadError::ApiError(format!("MIME error: {}", e)))?;
-
-        let form = multipart::Form::new().part("file", part);
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", path)?;
 
         let url = format!("{}/v2/upload?visibility={}", BASE_URL, visibility);
+        eprintln!("[upload] POST {}", url);
 
         let resp = self
             .client
             .post(&url)
             .header("Authorization", &self.api_key)
             .multipart(form)
-            .send()
-            .await
-            .map_err(UploadError::Network)?;
+            .send()?;
 
         let status = resp.status();
+        eprintln!("[upload] response status={}", status);
 
         if status.as_u16() == 409 {
             return Err(UploadError::Duplicate);
@@ -111,12 +118,11 @@ impl BallchasingClient {
             return Err(UploadError::RateLimited);
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().unwrap_or_default();
+            eprintln!("[upload] error body: {}", body);
             return Err(UploadError::ApiError(format!("({}): {}", status, body)));
         }
 
-        resp.json()
-            .await
-            .map_err(|e| UploadError::ApiError(format!("Parse error: {}", e)))
+        Ok(resp.json()?)
     }
 }
