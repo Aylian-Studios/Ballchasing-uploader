@@ -243,7 +243,7 @@ impl UploaderApp {
                             }
                         }
                     }
-                    Err(e) => eprintln!("Update check failed: {}", e),
+                    Err(e) => log::error!("Update check failed: {}", e),
                 }
             });
         }
@@ -263,7 +263,7 @@ impl UploaderApp {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
         if s.watcher_active {
-            eprintln!("Auto-upload: already active");
+            log::warn!("Auto-upload: already active");
             return;
         }
 
@@ -271,14 +271,14 @@ impl UploaderApp {
         let has_folders = !s.config.watch_dirs.is_empty();
 
         if !has_key {
-            eprintln!("Auto-upload abort: No API key configured");
+            log::warn!("Auto-upload abort: No API key configured");
             s.status_message = "Verify your API key first".to_string();
             s.auto_upload = false;
             return;
         }
 
         if !has_folders {
-            eprintln!("Auto-upload abort: No replay folders configured");
+            log::warn!("Auto-upload abort: No replay folders configured");
             s.status_message = "Add a replay folder first".to_string();
             s.auto_upload = false;
             return;

@@ -100,9 +100,9 @@ impl UploaderConfig {
                         }
                         return config;
                     }
-                    Err(e) => eprintln!("Warning: config parse error: {}", e),
+                    Err(e) => log::warn!("Warning: config parse error: {}", e),
                 },
-                Err(e) => eprintln!("Warning: config read error: {}", e),
+                Err(e) => log::warn!("Warning: config read error: {}", e),
             }
         }
         Self::default()

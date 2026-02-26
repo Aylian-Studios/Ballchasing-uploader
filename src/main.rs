@@ -9,6 +9,7 @@ mod watcher;
 use eframe::egui;
 
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let icon = load_icon();
 
     let options = eframe::NativeOptions {

@@ -97,7 +97,7 @@ impl BallchasingClient {
         let form = reqwest::blocking::multipart::Form::new().file("file", path)?;
 
         let url = format!("{}/v2/upload?visibility={}", BASE_URL, visibility);
-        eprintln!("[upload] POST {}", url);
+        log::info!("[upload] POST {}", url);
 
         let resp = self
             .client
@@ -107,7 +107,7 @@ impl BallchasingClient {
             .send()?;
 
         let status = resp.status();
-        eprintln!("[upload] response status={}", status);
+        log::info!("[upload] response status={}", status);
 
         if status.as_u16() == 409 {
             return Err(UploadError::Duplicate);
@@ -117,7 +117,7 @@ impl BallchasingClient {
         }
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();
-            eprintln!("[upload] error body: {}", body);
+            log::error!("[upload] error body: {}", body);
             return Err(UploadError::ApiError(format!("({}): {}", status, body)));
         }
 

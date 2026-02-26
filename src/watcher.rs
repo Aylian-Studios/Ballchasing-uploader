@@ -18,7 +18,7 @@ pub fn watch_directories(dirs: &[PathBuf]) -> Result<mpsc::Receiver<PathBuf>> {
         let mut debouncer = match new_debouncer(Duration::from_millis(500), notify_tx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("Failed to create file watcher: {}", e);
+                log::error!("Failed to create file watcher: {}", e);
                 return;
             }
         };
@@ -28,9 +28,9 @@ pub fn watch_directories(dirs: &[PathBuf]) -> Result<mpsc::Receiver<PathBuf>> {
                 .watcher()
                 .watch(dir, notify::RecursiveMode::NonRecursive)
             {
-                eprintln!("Failed to watch directory {:?}: {}", dir, e);
+                log::error!("Failed to watch directory {:?}: {}", dir, e);
             } else {
-                println!("Watching {:?} for new replays...", dir);
+                log::info!("Watching {:?} for new replays...", dir);
             }
         }
 
@@ -39,7 +39,7 @@ pub fn watch_directories(dirs: &[PathBuf]) -> Result<mpsc::Receiver<PathBuf>> {
                 if event.kind == DebouncedEventKind::Any {
                     let path = event.path;
                     if path.extension().is_some_and(|ext| ext == "replay") && path.exists() {
-                        println!(
+                        log::info!(
                             "New replay detected: {:?}",
                             path.file_name().unwrap_or_default()
                         );
