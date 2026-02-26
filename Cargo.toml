@@ -1,6 +1,6 @@
 [package]
 name = "ballchasing_uploader"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Auto-upload Rocket League replays to ballchasing.com"
 license = "MIT"
