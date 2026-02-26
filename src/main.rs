@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod app;
 mod config;
 mod upload_queue;
 mod watcher;
-mod app;
 
 use eframe::egui;
 
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn load_icon() -> Option<egui::IconData> {
-    let icon_run = | | -> anyhow::Result<egui::IconData> {
+    let icon_run = || -> anyhow::Result<egui::IconData> {
         let icon_bytes = include_bytes!("../LogoA.png");
         let image = image::load_from_memory(icon_bytes)?.to_rgba8();
         let (width, height) = image.dimensions();

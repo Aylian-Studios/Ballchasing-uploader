@@ -16,10 +16,10 @@ pub enum ApiKeyStatus {
     Invalid(String),
 }
 
-#[derive(Debug, Clone)]
-pub enum FolderStatus {
-    Detected(PathBuf),
-    NotFound,
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppTab {
+    Dashboard,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +43,8 @@ pub struct UploaderState {
     pub show_api_key: bool,
     pub api_key_status: ApiKeyStatus,
 
-    // Replay Folder
-    pub folder_status: FolderStatus,
+    // Tabs
+    pub current_tab: AppTab,
 
     // Config & persistence
     pub config: config::UploaderConfig,
@@ -72,16 +72,7 @@ impl UploaderState {
         let config_path = config::default_config_path();
         let cfg = config::UploaderConfig::load(&config_path);
 
-        let folder_status = if cfg.watch_dir.exists() {
-            FolderStatus::Detected(cfg.watch_dir.clone())
-        } else {
-            let default_dir = config::default_replay_dir();
-            if default_dir.exists() {
-                FolderStatus::Detected(default_dir)
-            } else {
-                FolderStatus::NotFound
-            }
-        };
+        let current_tab = AppTab::Dashboard;
 
         let api_key_input = cfg.api_key.clone();
 
@@ -89,7 +80,7 @@ impl UploaderState {
             api_key_input,
             show_api_key: false,
             api_key_status: ApiKeyStatus::Unknown,
-            folder_status,
+            current_tab,
             config: cfg,
             config_path,
             auto_upload: true,
@@ -112,26 +103,30 @@ impl UploaderState {
 
     pub fn update_log(&mut self, file_name: &str, status: UploadLogStatus) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        if let Some(entry) = self.upload_log.iter_mut().find(|e| e.file_name == file_name) {
+        if let Some(entry) = self
+            .upload_log
+            .iter_mut()
+            .find(|e| e.file_name == file_name)
+        {
             entry.status = status;
             entry.time = time;
         } else {
-            self.upload_log.insert(0, UploadLogEntry {
-                file_name: file_name.to_string(),
-                status,
-                time,
-            });
+            self.upload_log.insert(
+                0,
+                UploadLogEntry {
+                    file_name: file_name.to_string(),
+                    status,
+                    time,
+                },
+            );
             if self.upload_log.len() > 20 {
                 self.upload_log.truncate(20);
             }
         }
     }
 
-    pub fn effective_watch_dir(&self) -> Option<PathBuf> {
-        match &self.folder_status {
-            FolderStatus::Detected(p) => Some(p.clone()),
-            FolderStatus::NotFound => None,
-        }
+    pub fn configured_watch_dirs(&self) -> Vec<PathBuf> {
+        self.config.watch_dirs.clone()
     }
 }
 
@@ -150,7 +145,7 @@ struct RenderSnapshot {
     api_key_input: String,
     show_api_key: bool,
     api_key_status: ApiKeyStatus,
-    folder_status: FolderStatus,
+    current_tab: AppTab,
     visibility: config::Visibility,
     auto_upload: bool,
     watcher_active: bool,
@@ -184,18 +179,15 @@ impl UploaderApp {
                     let client = api::BallchasingClient::new(&key);
                     match client.ping() {
                         Ok(info) => {
-                            let mut s =
-                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
                             s.api_key_status = ApiKeyStatus::Valid {
                                 name: info.name,
                                 account_type: info.account_type,
                             };
                         }
                         Err(e) => {
-                            let mut s =
-                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                            s.api_key_status =
-                                ApiKeyStatus::Invalid(format!("{}", e));
+                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status = ApiKeyStatus::Invalid(format!("{}", e));
                         }
                     }
                 });
@@ -221,8 +213,7 @@ impl UploaderApp {
                 queue.prune_expired();
                 let count = queue.pending().len();
                 if count > 0 {
-                    let mut s =
-                        state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
                     s.status_message = format!("Retrying {} pending upload(s)...", count);
                 }
             });
@@ -241,7 +232,12 @@ impl UploaderApp {
                 {
                     Ok(updater) => {
                         if let Ok(latest) = updater.get_latest_release() {
-                            if self_update::version::bump_is_greater(env!("CARGO_PKG_VERSION"), &latest.version).unwrap_or(false) {
+                            if self_update::version::bump_is_greater(
+                                env!("CARGO_PKG_VERSION"),
+                                &latest.version,
+                            )
+                            .unwrap_or(false)
+                            {
                                 let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
                                 s.update_available = Some(latest.version);
                             }
@@ -253,7 +249,9 @@ impl UploaderApp {
         }
 
         if state.lock().unwrap().auto_upload {
-            let app = Self { state: state.clone() };
+            let app = Self {
+                state: state.clone(),
+            };
             app.start_watcher();
             return app;
         }
@@ -263,14 +261,14 @@ impl UploaderApp {
 
     fn start_watcher(&self) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        
+
         if s.watcher_active {
             eprintln!("Auto-upload: already active");
             return;
         }
-        
+
         let has_key = !s.config.api_key.is_empty();
-        let has_folder = s.effective_watch_dir().is_some();
+        let has_folders = !s.config.watch_dirs.is_empty();
 
         if !has_key {
             eprintln!("Auto-upload abort: No API key configured");
@@ -278,24 +276,25 @@ impl UploaderApp {
             s.auto_upload = false;
             return;
         }
-        
-        if !has_folder {
-            eprintln!("Auto-upload abort: No replay folder detected");
-            s.status_message = "Set replay folder first".to_string();
+
+        if !has_folders {
+            eprintln!("Auto-upload abort: No replay folders configured");
+            s.status_message = "Add a replay folder first".to_string();
             s.auto_upload = false;
             return;
         }
 
-        let watch_dir = s.effective_watch_dir().unwrap();
+        let watch_dirs = s.config.watch_dirs.clone();
         let api_key = s.config.api_key.clone();
         let visibility = s.config.visibility.as_str().to_string();
         let state_clone = self.state.clone();
         let config_path = s.config_path.clone();
 
-        match watcher::watch_directory(&watch_dir) {
+        match watcher::watch_directories(&watch_dirs) {
             Ok(rx) => {
                 s.watcher_active = true;
-                s.status_message = format!("Watching {:?} for new replays...", watch_dir);
+                s.status_message =
+                    format!("Watching {} folders for new replays...", watch_dirs.len());
                 drop(s);
 
                 std::thread::spawn(move || {
@@ -308,7 +307,7 @@ impl UploaderApp {
                                 {
                                     let s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
                                     if !s.auto_upload {
-                                        break; 
+                                        break;
                                     }
                                 }
                                 process_new_file(
@@ -344,7 +343,7 @@ impl eframe::App for UploaderApp {
                 api_key_input: s.api_key_input.clone(),
                 show_api_key: s.show_api_key,
                 api_key_status: s.api_key_status.clone(),
-                folder_status: s.folder_status.clone(),
+                current_tab: s.current_tab.clone(),
                 visibility: s.config.visibility.clone(),
                 auto_upload: s.auto_upload,
                 watcher_active: s.watcher_active,
@@ -361,22 +360,34 @@ impl eframe::App for UploaderApp {
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak().small());
-                
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .weak()
+                        .small(),
+                );
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.hyperlink_to("Aylian Studios", "https://aylian-studios.com");
                     ui.label(egui::RichText::new("Built by ").weak());
-                    
+
                     ui.separator();
-                    
-                    ui.hyperlink_to("GitHub", "https://github.com/Aylian-Studios/ballchasing-uploader");
+
+                    ui.hyperlink_to(
+                        "GitHub",
+                        "https://github.com/Aylian-Studios/ballchasing-uploader",
+                    );
                     ui.label("|");
-                    ui.hyperlink_to("Project Page", "https://aylian-studios.com/projects/ballchasing-uploader");
-                    
+                    ui.hyperlink_to(
+                        "Project Page",
+                        "https://aylian-studios.com/projects/ballchasing-uploader",
+                    );
+
                     ui.separator();
-                    
+
                     if ui.link("Check for Updates").clicked() {
-                        let _ = open::that("https://github.com/Aylian-Studios/ballchasing-uploader/releases");
+                        let _ = open::that(
+                            "https://github.com/Aylian-Studios/ballchasing-uploader/releases",
+                        );
                     }
                 });
             });
@@ -390,64 +401,97 @@ impl eframe::App for UploaderApp {
                     ui.horizontal(|ui| {
                         if snap.update_in_progress {
                             ui.spinner();
-                            ui.label(egui::RichText::new(format!("Downloading update v{}...", version)).strong());
+                            ui.label(
+                                egui::RichText::new(format!("Downloading update v{}...", version))
+                                    .strong(),
+                            );
                             if let Some(status) = &snap.update_status {
                                 ui.label(egui::RichText::new(status).weak());
                             }
                         } else {
-                            ui.label(egui::RichText::new(format!("Update v{} is available!", version)).strong().color(egui::Color32::from_rgb(100, 200, 255)));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("❌").on_hover_text("Close").clicked() {
-                                    let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    s.update_dismissed = true;
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Remind me later").clicked() {
-                                    let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    s.update_dismissed = true;
-                                }
-                                ui.add_space(4.0);
-                                if ui.button(egui::RichText::new("Install Now").color(egui::Color32::WHITE)).clicked() {
-                                    let state_clone = self.state.clone();
-                                    {
-                                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                                        s.update_in_progress = true;
-                                        s.update_status = Some("Starting download...".to_string());
+                            ui.label(
+                                egui::RichText::new(format!("Update v{} is available!", version))
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(100, 200, 255)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("❌").on_hover_text("Close").clicked() {
+                                        let mut s =
+                                            self.state.lock().unwrap_or_else(|p| p.into_inner());
+                                        s.update_dismissed = true;
                                     }
-                                    std::thread::spawn(move || {
-                                        let status_update = |msg: &str| {
-                                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                            s.update_status = Some(msg.to_string());
-                                        };
-                                        
-                                        let update_result = self_update::backends::github::Update::configure()
-                                            .repo_owner("Aylian-Studios")
-                                            .repo_name("ballchasing-uploader")
-                                            .bin_name("ballchasing-uploader")
-                                            .show_download_progress(false)
-                                            .current_version(env!("CARGO_PKG_VERSION"))
-                                            .build()
-                                            .and_then(|updater| updater.update());
-                                            
-                                        match update_result {
-                                            Ok(status) => {
-                                                status_update(&format!("Updated to {}! Restarting...", status.version()));
-                                                std::thread::sleep(Duration::from_secs(1));
-                                                
-                                                if let Ok(current_exe) = std::env::current_exe() {
-                                                    let _ = std::process::Command::new(current_exe).spawn();
-                                                    std::process::exit(0);
+                                    ui.add_space(4.0);
+                                    if ui.button("Remind me later").clicked() {
+                                        let mut s =
+                                            self.state.lock().unwrap_or_else(|p| p.into_inner());
+                                        s.update_dismissed = true;
+                                    }
+                                    ui.add_space(4.0);
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("Install Now")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .clicked()
+                                    {
+                                        let state_clone = self.state.clone();
+                                        {
+                                            let mut s = self
+                                                .state
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            s.update_in_progress = true;
+                                            s.update_status =
+                                                Some("Starting download...".to_string());
+                                        }
+                                        std::thread::spawn(move || {
+                                            let status_update = |msg: &str| {
+                                                let mut s = state_clone
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner());
+                                                s.update_status = Some(msg.to_string());
+                                            };
+
+                                            let update_result =
+                                                self_update::backends::github::Update::configure()
+                                                    .repo_owner("Aylian-Studios")
+                                                    .repo_name("ballchasing-uploader")
+                                                    .bin_name("ballchasing-uploader")
+                                                    .show_download_progress(false)
+                                                    .current_version(env!("CARGO_PKG_VERSION"))
+                                                    .build()
+                                                    .and_then(|updater| updater.update());
+
+                                            match update_result {
+                                                Ok(status) => {
+                                                    status_update(&format!(
+                                                        "Updated to {}! Restarting...",
+                                                        status.version()
+                                                    ));
+                                                    std::thread::sleep(Duration::from_secs(1));
+
+                                                    if let Ok(current_exe) = std::env::current_exe()
+                                                    {
+                                                        let _ =
+                                                            std::process::Command::new(current_exe)
+                                                                .spawn();
+                                                        std::process::exit(0);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let mut s = state_clone
+                                                        .lock()
+                                                        .unwrap_or_else(|p| p.into_inner());
+                                                    s.update_in_progress = false;
+                                                    s.update_status = Some(format!("Error: {}", e));
                                                 }
                                             }
-                                            Err(e) => {
-                                                let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                                                s.update_in_progress = false;
-                                                s.update_status = Some(format!("Error: {}", e));
-                                            }
-                                        }
-                                    });
-                                }
-                            });
+                                        });
+                                    }
+                                },
+                            );
                         }
                     });
                     ui.add_space(8.0);
@@ -456,49 +500,76 @@ impl eframe::App for UploaderApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Ballchasing Uploader");
-            ui.label(egui::RichText::new(format!("v{} — Auto-upload replays to ballchasing.com", env!("CARGO_PKG_VERSION"))).weak().small());
-            ui.separator();
-            ui.add_space(4.0);
-            self.render_api_key_section(ui, &snap);
-            ui.add_space(4.0);
-
-            if let ApiKeyStatus::Valid {
-                ref name,
-                ref account_type,
-            } = snap.api_key_status
-            {
-                let (tier_name, rate_info) = tier_display(account_type);
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Account: {}", name)).strong(),
-                        );
-                        ui.separator();
-                        ui.label(format!("Tier: {}", tier_name));
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("Rate: {}", rate_info))
-                                .weak(),
-                        );
-                    });
+            ui.horizontal(|ui| {
+                ui.heading("Ballchasing Uploader");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(snap.current_tab == AppTab::Settings, "⚙ Settings")
+                        .clicked()
+                    {
+                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        s.current_tab = AppTab::Settings;
+                    }
+                    if ui
+                        .selectable_label(snap.current_tab == AppTab::Dashboard, "📊 Dashboard")
+                        .clicked()
+                    {
+                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        s.current_tab = AppTab::Dashboard;
+                    }
                 });
-                ui.add_space(4.0);
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "v{} — Auto-upload replays to ballchasing.com",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .weak()
+                .small(),
+            );
+            ui.separator();
+            ui.add_space(4.0);
+
+            match snap.current_tab {
+                AppTab::Dashboard => {
+                    self.render_api_key_section(ui, &snap);
+                    ui.add_space(4.0);
+
+                    if let ApiKeyStatus::Valid {
+                        ref name,
+                        ref account_type,
+                    } = snap.api_key_status
+                    {
+                        let (tier_name, rate_info) = tier_display(account_type);
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Account: {}", name)).strong(),
+                                );
+                                ui.separator();
+                                ui.label(format!("Tier: {}", tier_name));
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(format!("Rate: {}", rate_info)).weak(),
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    ui.separator();
+                    ui.add_space(4.0);
+                    self.render_upload_settings(ui, &snap);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    self.render_upload_log(ui, &snap);
+                }
+                AppTab::Settings => {
+                    self.render_settings_tab(ui, &snap);
+                }
             }
-
-            ui.separator();
-            ui.add_space(4.0);
-
-            self.render_folder_section(ui, &snap);
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-            self.render_upload_settings(ui, &snap);
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            self.render_upload_log(ui, &snap);
 
             ui.add_space(8.0);
             ui.separator();
@@ -559,18 +630,15 @@ impl UploaderApp {
                     let client = api::BallchasingClient::new(&key);
                     match client.ping() {
                         Ok(info) => {
-                            let mut s =
-                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
                             s.api_key_status = ApiKeyStatus::Valid {
                                 name: info.name,
                                 account_type: info.account_type,
                             };
                         }
                         Err(e) => {
-                            let mut s =
-                                state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                            s.api_key_status =
-                                ApiKeyStatus::Invalid(format!("{}", e));
+                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                            s.api_key_status = ApiKeyStatus::Invalid(format!("{}", e));
                         }
                     }
                 });
@@ -605,57 +673,121 @@ impl UploaderApp {
         }
     }
 
-    fn render_folder_section(&self, ui: &mut egui::Ui, snap: &RenderSnapshot) {
-        ui.label(egui::RichText::new("Replay Folder").strong());
-        ui.add_space(2.0);
+    fn render_settings_tab(&self, ui: &mut egui::Ui, _snap: &RenderSnapshot) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new("Replay Folders").strong());
+            ui.add_space(2.0);
 
-        match &snap.folder_status {
-            FolderStatus::Detected(path) => {
-                ui.label(
-                    egui::RichText::new("Replay folder found")
-                        .color(egui::Color32::GREEN),
-                );
-                ui.label(
-                    egui::RichText::new(path.display().to_string())
-                        .monospace()
-                        .weak()
-                        .small(),
-                );
-            }
-            FolderStatus::NotFound => {
-                ui.label(
-                    egui::RichText::new("Replay folder not found")
-                        .color(egui::Color32::RED),
-                );
-            }
-        }
+            let watch_dirs = {
+                let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                s.config.watch_dirs.clone()
+            };
 
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if matches!(snap.folder_status, FolderStatus::NotFound)
-                && ui.button("Retry").clicked() {
-                    let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let default_dir = config::default_replay_dir();
-                    if default_dir.exists() {
-                        s.folder_status = FolderStatus::Detected(default_dir.clone());
-                        s.config.watch_dir = default_dir;
-                        let _ = s.config.save(&s.config_path);
+            for (idx, dir) in watch_dirs.clone().into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if dir.exists() {
+                        ui.label(egui::RichText::new("✓").color(egui::Color32::GREEN));
                     } else {
-                        s.folder_status = FolderStatus::NotFound;
+                        ui.label(egui::RichText::new("⚠").color(egui::Color32::RED));
                     }
-                }
-
-            if ui.button("Browse...").clicked() {
-                let state_clone = self.state.clone();
-                std::thread::spawn(move || {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        let mut s =
-                            state_clone.lock().unwrap_or_else(|p| p.into_inner());
-                        s.folder_status = FolderStatus::Detected(folder.clone());
-                        s.config.watch_dir = folder;
+                    ui.label(
+                        egui::RichText::new(dir.display().to_string())
+                            .weak()
+                            .monospace()
+                            .small(),
+                    );
+                    if ui.button("Remove").clicked() {
+                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        s.config.watch_dirs.remove(idx);
                         let _ = s.config.save(&s.config_path);
                     }
                 });
+            }
+
+            ui.add_space(4.0);
+            if ui.button("Add Folder...").clicked() {
+                let state_clone = self.state.clone();
+                std::thread::spawn(move || {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                        if !s.config.watch_dirs.contains(&folder) {
+                            s.config.watch_dirs.push(folder);
+                            let _ = s.config.save(&s.config_path);
+                        }
+                    }
+                });
+            }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+
+            ui.label(egui::RichText::new("BakkesMod Settings").strong());
+            ui.add_space(4.0);
+
+            let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut save_needed = false;
+
+            let mut enable_safe_mode = s.config.enable_safe_mode;
+            if ui
+                .checkbox(&mut enable_safe_mode, "Enable safe mode")
+                .changed()
+            {
+                s.config.enable_safe_mode = enable_safe_mode;
+                save_needed = true;
+            }
+
+            let mut run_on_startup = s.config.run_on_startup;
+            if ui.checkbox(&mut run_on_startup, "Run on startup").changed() {
+                s.config.run_on_startup = run_on_startup;
+                save_needed = true;
+
+                if let Ok(current_exe) = std::env::current_exe() {
+                    let app_name = "BallchasingUploader";
+                    if let Ok(auto) = auto_launch::AutoLaunchBuilder::new()
+                        .set_app_name(app_name)
+                        .set_app_path(&current_exe.to_string_lossy())
+                        .set_macos_launch_mode(auto_launch::MacOSLaunchMode::LaunchAgent)
+                        .build()
+                    {
+                        if run_on_startup {
+                            let _ = auto.enable();
+                        } else {
+                            let _ = auto.disable();
+                        }
+                    }
+                }
+            }
+
+            let mut hide_when_minimized = s.config.hide_when_minimized;
+            if ui
+                .checkbox(&mut hide_when_minimized, "Hide when minimized")
+                .changed()
+            {
+                s.config.hide_when_minimized = hide_when_minimized;
+                save_needed = true;
+            }
+
+            let mut minimize_on_start = s.config.minimize_on_start;
+            if ui
+                .checkbox(&mut minimize_on_start, "Minimize on start")
+                .changed()
+            {
+                s.config.minimize_on_start = minimize_on_start;
+                save_needed = true;
+            }
+
+            let mut disable_warnings = s.config.disable_warnings;
+            if ui
+                .checkbox(&mut disable_warnings, "Disable warnings")
+                .changed()
+            {
+                s.config.disable_warnings = disable_warnings;
+                save_needed = true;
+            }
+
+            if save_needed {
+                let _ = s.config.save(&s.config_path);
             }
         });
     }
@@ -681,8 +813,7 @@ impl UploaderApp {
                             .selectable_label(current_label == *value, *label)
                             .clicked()
                         {
-                            let mut s =
-                                self.state.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
                             if let Ok(vis) = value.parse::<config::Visibility>() {
                                 s.config.visibility = vis;
                                 let _ = s.config.save(&s.config_path);
@@ -732,26 +863,14 @@ impl UploaderApp {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 let (color, icon) = match &entry.status {
-                                    UploadLogStatus::Uploading => {
-                                        (egui::Color32::YELLOW, "...")
-                                    }
-                                    UploadLogStatus::Success(_) => {
-                                        (egui::Color32::GREEN, "[ok]")
-                                    }
-                                    UploadLogStatus::Duplicate => {
-                                        (egui::Color32::GRAY, "[dup]")
-                                    }
-                                    UploadLogStatus::Failed(_) => {
-                                        (egui::Color32::RED, "[!]")
-                                    }
+                                    UploadLogStatus::Uploading => (egui::Color32::YELLOW, "..."),
+                                    UploadLogStatus::Success(_) => (egui::Color32::GREEN, "[ok]"),
+                                    UploadLogStatus::Duplicate => (egui::Color32::GRAY, "[dup]"),
+                                    UploadLogStatus::Failed(_) => (egui::Color32::RED, "[!]"),
                                 };
                                 ui.colored_label(color, icon);
-                                ui.label(
-                                    egui::RichText::new(&entry.file_name).small(),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&entry.time).weak().small(),
-                                );
+                                ui.label(egui::RichText::new(&entry.file_name).small());
+                                ui.label(egui::RichText::new(&entry.time).weak().small());
                             });
                             if let UploadLogStatus::Failed(ref err) = entry.status {
                                 ui.label(
@@ -822,9 +941,10 @@ fn process_new_file(
     if !wait_for_file_stable(path) {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-        s.update_log(&file_name, UploadLogStatus::Failed(
-            format!("File not ready after 12s (size: {} bytes)", size),
-        ));
+        s.update_log(
+            &file_name,
+            UploadLogStatus::Failed(format!("File not ready after 12s (size: {} bytes)", size)),
+        );
         return;
     }
 
@@ -832,9 +952,10 @@ fn process_new_file(
         Ok(h) => h,
         Err(e) => {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-            s.update_log(&file_name, UploadLogStatus::Failed(
-                format!("Hash error: {}", e),
-            ));
+            s.update_log(
+                &file_name,
+                UploadLogStatus::Failed(format!("Hash error: {}", e)),
+            );
             return;
         }
     };
@@ -852,7 +973,11 @@ fn process_new_file(
         s.add_log(UploadLogEntry {
             file_name: file_name.clone(),
             status: UploadLogStatus::Uploading,
-            time: format!("{} ({}KB)", chrono::Local::now().format("%H:%M:%S"), file_size / 1024),
+            time: format!(
+                "{} ({}KB)",
+                chrono::Local::now().format("%H:%M:%S"),
+                file_size / 1024
+            ),
         });
     }
 

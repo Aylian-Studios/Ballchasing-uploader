@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-pub fn watch_directory(dir: &PathBuf) -> Result<mpsc::Receiver<PathBuf>> {
+pub fn watch_directories(dirs: &[PathBuf]) -> Result<mpsc::Receiver<PathBuf>> {
     let (tx, rx) = mpsc::channel();
-    let dir = dir.clone();
 
-    if !dir.exists() {
-        anyhow::bail!("Watch directory does not exist: {:?}", dir);
+    let valid_dirs: Vec<PathBuf> = dirs.iter().filter(|d| d.exists()).cloned().collect();
+    if valid_dirs.is_empty() {
+        anyhow::bail!("None of the watch directories exist");
     }
 
     std::thread::spawn(move || {
@@ -23,35 +23,29 @@ pub fn watch_directory(dir: &PathBuf) -> Result<mpsc::Receiver<PathBuf>> {
             }
         };
 
-        if let Err(e) = debouncer
-            .watcher()
-            .watch(&dir, notify::RecursiveMode::NonRecursive)
-        {
-            eprintln!("Failed to watch directory {:?}: {}", dir, e);
-            return;
+        for dir in &valid_dirs {
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(dir, notify::RecursiveMode::NonRecursive)
+            {
+                eprintln!("Failed to watch directory {:?}: {}", dir, e);
+            } else {
+                println!("Watching {:?} for new replays...", dir);
+            }
         }
 
-        println!("Watching {:?} for new replays...", dir);
-
-        loop {
-            match notify_rx.recv() {
-                Ok(Ok(events)) => {
-                    for event in events {
-                        if event.kind == DebouncedEventKind::Any {
-                            let path = event.path;
-                            if path.extension().is_some_and(|ext| ext == "replay")
-                                && path.exists()
-                            {
-                                println!("New replay detected: {:?}", path.file_name().unwrap_or_default());
-                                let _ = tx.send(path);
-                            }
-                        }
+        while let Ok(Ok(events)) = notify_rx.recv() {
+            for event in events {
+                if event.kind == DebouncedEventKind::Any {
+                    let path = event.path;
+                    if path.extension().is_some_and(|ext| ext == "replay") && path.exists() {
+                        println!(
+                            "New replay detected: {:?}",
+                            path.file_name().unwrap_or_default()
+                        );
+                        let _ = tx.send(path);
                     }
                 }
-                Ok(Err(errors)) => {
-                    eprintln!("Watch error: {:?}", errors);
-                }
-                Err(_) => break, // Channel closed
             }
         }
     });

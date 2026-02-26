@@ -94,8 +94,7 @@ impl BallchasingClient {
     ) -> std::result::Result<UploadResponse, UploadError> {
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let form = reqwest::blocking::multipart::Form::new()
-            .file("file", path)?;
+        let form = reqwest::blocking::multipart::Form::new().file("file", path)?;
 
         let url = format!("{}/v2/upload?visibility={}", BASE_URL, visibility);
         eprintln!("[upload] POST {}", url);

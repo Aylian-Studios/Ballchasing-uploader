@@ -1,6 +1,6 @@
 [package]
 name = "ballchasing_uploader"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Auto-upload Rocket League replays to ballchasing.com"
 license = "MIT"
@@ -29,3 +29,4 @@ rfd = "0.12"
 image = { version = "0.24", default-features = false, features = ["png"] }
 open = "5.0"
 self_update = { version = "0.41.0", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate", "compression-zip-bzip2"] }
+auto-launch = "0.6.0"
