@@ -59,6 +59,12 @@ pub struct UploaderState {
 
     // Status bar
     pub status_message: String,
+
+    // Auto-update
+    pub update_available: Option<String>,
+    pub update_dismissed: bool,
+    pub update_status: Option<String>,
+    pub update_in_progress: bool,
 }
 
 impl UploaderState {
@@ -90,6 +96,10 @@ impl UploaderState {
             watcher_active: false,
             upload_log: Vec::new(),
             status_message: "Idle".to_string(),
+            update_available: None,
+            update_dismissed: false,
+            update_status: None,
+            update_in_progress: false,
         }
     }
 
@@ -146,6 +156,10 @@ struct RenderSnapshot {
     watcher_active: bool,
     upload_log: Vec<UploadLogEntry>,
     status_message: String,
+    update_available: Option<String>,
+    update_dismissed: bool,
+    update_status: Option<String>,
+    update_in_progress: bool,
 }
 
 pub struct UploaderApp {
@@ -210,6 +224,30 @@ impl UploaderApp {
                     let mut s =
                         state_clone.lock().unwrap_or_else(|p| p.into_inner());
                     s.status_message = format!("Retrying {} pending upload(s)...", count);
+                }
+            });
+        }
+
+        // Background Update Checker
+        {
+            let state_clone = state.clone();
+            std::thread::spawn(move || {
+                match self_update::backends::github::Update::configure()
+                    .repo_owner("Aylian-Studios")
+                    .repo_name("ballchasing-uploader")
+                    .bin_name("ballchasing-uploader")
+                    .current_version(env!("CARGO_PKG_VERSION"))
+                    .build()
+                {
+                    Ok(updater) => {
+                        if let Ok(latest) = updater.get_latest_release() {
+                            if self_update::version::bump_is_greater(env!("CARGO_PKG_VERSION"), &latest.version).unwrap_or(false) {
+                                let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                                s.update_available = Some(latest.version);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Update check failed: {}", e),
                 }
             });
         }
@@ -312,6 +350,10 @@ impl eframe::App for UploaderApp {
                 watcher_active: s.watcher_active,
                 upload_log: s.upload_log.clone(),
                 status_message: s.status_message.clone(),
+                update_available: s.update_available.clone(),
+                update_dismissed: s.update_dismissed,
+                update_status: s.update_status.clone(),
+                update_in_progress: s.update_in_progress,
             }
         };
 
@@ -334,12 +376,84 @@ impl eframe::App for UploaderApp {
                     ui.separator();
                     
                     if ui.link("Check for Updates").clicked() {
-                        let _ = open::that("https://github.com/DarknessPledge/ballchasing-uploader/releases");
+                        let _ = open::that("https://github.com/Aylian-Studios/ballchasing-uploader/releases");
                     }
                 });
             });
             ui.add_space(2.0);
         });
+
+        if let Some(version) = &snap.update_available {
+            if !snap.update_dismissed {
+                egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if snap.update_in_progress {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(format!("Downloading update v{}...", version)).strong());
+                            if let Some(status) = &snap.update_status {
+                                ui.label(egui::RichText::new(status).weak());
+                            }
+                        } else {
+                            ui.label(egui::RichText::new(format!("Update v{} is available!", version)).strong().color(egui::Color32::from_rgb(100, 200, 255)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("❌").on_hover_text("Close").clicked() {
+                                    let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                                    s.update_dismissed = true;
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("Remind me later").clicked() {
+                                    let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                                    s.update_dismissed = true;
+                                }
+                                ui.add_space(4.0);
+                                if ui.button(egui::RichText::new("Install Now").color(egui::Color32::WHITE)).clicked() {
+                                    let state_clone = self.state.clone();
+                                    {
+                                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                                        s.update_in_progress = true;
+                                        s.update_status = Some("Starting download...".to_string());
+                                    }
+                                    std::thread::spawn(move || {
+                                        let status_update = |msg: &str| {
+                                            let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                                            s.update_status = Some(msg.to_string());
+                                        };
+                                        
+                                        let update_result = self_update::backends::github::Update::configure()
+                                            .repo_owner("Aylian-Studios")
+                                            .repo_name("ballchasing-uploader")
+                                            .bin_name("ballchasing-uploader")
+                                            .show_download_progress(false)
+                                            .current_version(env!("CARGO_PKG_VERSION"))
+                                            .build()
+                                            .and_then(|updater| updater.update());
+                                            
+                                        match update_result {
+                                            Ok(status) => {
+                                                status_update(&format!("Updated to {}! Restarting...", status.version()));
+                                                std::thread::sleep(Duration::from_secs(1));
+                                                
+                                                if let Ok(current_exe) = std::env::current_exe() {
+                                                    let _ = std::process::Command::new(current_exe).spawn();
+                                                    std::process::exit(0);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let mut s = state_clone.lock().unwrap_or_else(|p| p.into_inner());
+                                                s.update_in_progress = false;
+                                                s.update_status = Some(format!("Error: {}", e));
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Ballchasing Uploader");
@@ -518,8 +632,8 @@ impl UploaderApp {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if matches!(snap.folder_status, FolderStatus::NotFound) {
-                if ui.button("Retry").clicked() {
+            if matches!(snap.folder_status, FolderStatus::NotFound)
+                && ui.button("Retry").clicked() {
                     let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let default_dir = config::default_replay_dir();
                     if default_dir.exists() {
@@ -530,7 +644,6 @@ impl UploaderApp {
                         s.folder_status = FolderStatus::NotFound;
                     }
                 }
-            }
 
             if ui.button("Browse...").clicked() {
                 let state_clone = self.state.clone();
@@ -658,10 +771,7 @@ fn try_exclusive_access(path: &PathBuf) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::fs::OpenOptions;
-        match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        OpenOptions::new().read(true).write(true).open(path).is_ok()
     }
     #[cfg(not(target_os = "windows"))]
     {

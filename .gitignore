@@ -9,6 +9,7 @@ Cargo.lock
 .idea/
 *.user
 *.suo
+.agents/
 
 # Project Data
 *.replay

@@ -4,9 +4,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Visibility {
     Public,
     Unlisted,
+    #[default]
     Private,
 }
 
@@ -32,11 +34,6 @@ impl std::str::FromStr for Visibility {
     }
 }
 
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Private
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploaderConfig {

@@ -28,3 +28,4 @@ egui = "0.27"
 rfd = "0.12"
 image = { version = "0.24", default-features = false, features = ["png"] }
 open = "5.0"
+self_update = { version = "0.41.0", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate", "compression-zip-bzip2"] }

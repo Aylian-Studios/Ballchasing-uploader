@@ -39,7 +39,7 @@ pub fn watch_directory(dir: &PathBuf) -> Result<mpsc::Receiver<PathBuf>> {
                     for event in events {
                         if event.kind == DebouncedEventKind::Any {
                             let path = event.path;
-                            if path.extension().map_or(false, |ext| ext == "replay")
+                            if path.extension().is_some_and(|ext| ext == "replay")
                                 && path.exists()
                             {
                                 println!("New replay detected: {:?}", path.file_name().unwrap_or_default());
